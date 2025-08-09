@@ -8,7 +8,7 @@ import pandas as pd
 
 from .brokers.base import BrokerBase, Order
 from .risk import RiskManager
-from .strategy.sma_crossover import SmaParams, generate_signal
+from .strategy.sma_crossover import SmaParams, generate_signal, compute_atr
 
 
 @dataclass
@@ -16,6 +16,7 @@ class BotState:
     position_qty: int = 0
     average_price: float = 0.0
     realized_pnl: float = 0.0
+    stop_price: Optional[float] = None
 
 
 class IntradayBot:
@@ -41,6 +42,43 @@ class IntradayBot:
         cutoff = now_ist.replace(hour=cutoff_h, minute=cutoff_m, second=0, microsecond=0)
         return now_ist >= cutoff
 
+    def _update_trailing_stop(self, candles: pd.DataFrame) -> None:
+        if self.state.position_qty == 0:
+            self.state.stop_price = None
+            return
+        atr = compute_atr(candles, self.strategy_params.atr_period).iloc[-1]
+        last_close = float(candles["Close"].iloc[-1])
+        if self.state.position_qty > 0:
+            # Long: raise stop, never lower it
+            new_stop = last_close - self.strategy_params.atr_multiplier_sl * atr
+            self.state.stop_price = (
+                new_stop if self.state.stop_price is None else max(self.state.stop_price, new_stop)
+            )
+        else:
+            # Short: lower stop, never raise it
+            new_stop = last_close + self.strategy_params.atr_multiplier_sl * atr
+            self.state.stop_price = (
+                new_stop if self.state.stop_price is None else min(self.state.stop_price, new_stop)
+            )
+
+    def _check_stop_and_exit(self, candles: pd.DataFrame) -> bool:
+        if self.state.position_qty == 0 or self.state.stop_price is None:
+            return False
+        last_low = float(candles["Low"].iloc[-1])
+        last_high = float(candles["High"].iloc[-1])
+        stop = float(self.state.stop_price)
+        if self.state.position_qty > 0 and last_low <= stop:
+            # Stop hit for long
+            self._sell(self.state.position_qty, stop)
+            self.state.stop_price = None
+            return True
+        if self.state.position_qty < 0 and last_high >= stop:
+            # Stop hit for short
+            self._buy(abs(self.state.position_qty), stop)
+            self.state.stop_price = None
+            return True
+        return False
+
     def on_new_candles(self, candles: pd.DataFrame) -> None:
         # candles index assumed chronological
         price = float(candles["Close"].iloc[-1])
@@ -50,35 +88,50 @@ class IntradayBot:
             self._close_all(price)
             return
 
+        # Enforce existing stop first
+        if self._check_stop_and_exit(candles):
+            return
+
         # Strategy signal
         signal, stop_price = generate_signal(candles, self.strategy_params)
-        if signal == "FLAT" or stop_price is None:
+        if signal == "FLAT":
+            # Maintain trailing stop if in position
+            self._update_trailing_stop(candles)
             return
+
+        if stop_price is None:
+            # If strategy didn't provide a stop, derive one from ATR
+            atr = compute_atr(candles, self.strategy_params.atr_period).iloc[-1]
+            stop_price = price - self.strategy_params.atr_multiplier_sl * atr if signal == "BUY" else price + self.strategy_params.atr_multiplier_sl * atr
 
         # Positioning logic
         if signal == "BUY":
             if self.state.position_qty >= 0:
-                # Add/enter long
-                qty = self.risk.size_for_trade(price, stop_price)
+                qty = self.risk.size_for_trade(price, float(stop_price))
                 if qty > 0:
                     self._buy(qty, price)
+                    self.state.stop_price = float(stop_price)
             else:
-                # Reduce or flip from short to long
                 self._buy(abs(self.state.position_qty), price)
-                qty = self.risk.size_for_trade(price, stop_price)
+                qty = self.risk.size_for_trade(price, float(stop_price))
                 if qty > 0:
                     self._buy(qty, price)
+                self.state.stop_price = float(stop_price)
         elif signal == "SELL":
             if self.state.position_qty <= 0:
-                qty = self.risk.size_for_trade(price, stop_price)
+                qty = self.risk.size_for_trade(price, float(stop_price))
                 if qty > 0:
                     self._sell(qty, price)
+                    self.state.stop_price = float(stop_price)
             else:
-                # Reduce or flip from long to short
                 self._sell(abs(self.state.position_qty), price)
-                qty = self.risk.size_for_trade(price, stop_price)
+                qty = self.risk.size_for_trade(price, float(stop_price))
                 if qty > 0:
                     self._sell(qty, price)
+                self.state.stop_price = float(stop_price)
+
+        # After any action, adjust trailing stop with the latest candle
+        self._update_trailing_stop(candles)
 
     def _buy(self, quantity: int, price: float) -> None:
         if quantity <= 0:
@@ -92,7 +145,7 @@ class IntradayBot:
         if quantity <= 0:
             return
         result = self.broker.place_order(
-            Order(symbol=self.symbol, side="SELL", quantity=quantity, price=price, tag="entry")
+            Order(symbol=self.symbol, side="SELL", quantity=quantity, price=price, tag="exit" if self.state.position_qty > 0 else "entry")
         )
         self._update_position(-quantity, result.average_price or price)
 
@@ -126,3 +179,4 @@ class IntradayBot:
             self._sell(self.state.position_qty, price)
         elif self.state.position_qty < 0:
             self._buy(abs(self.state.position_qty), price)
+        self.state.stop_price = None
